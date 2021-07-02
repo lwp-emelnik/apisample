@@ -13,6 +13,8 @@ import android.media.AudioAttributes;
 import android.media.AudioFormat;
 import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
+import android.media.MediaMetadataRetriever;
+import android.media.MediaPlayer;
 import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.net.Uri;
@@ -25,6 +27,7 @@ import android.view.LayoutInflater;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import androidx.annotation.Nullable;
@@ -41,7 +44,7 @@ import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
-import java.util.HashSet;
+import java.util.LinkedList;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
 
@@ -49,8 +52,9 @@ public class AudioCaptureService extends Service {
     public final static String CAPTURES_DIRECTORY = Environment.getExternalStorageDirectory().getPath() + "/MusicIntervals2Anki/AudioCaptures";
 
     public final static String EXTRA_RESULT_DATA = "AudioCaptureService:Extra:ResultData";
+    public final static String EXTRA_RECORDINGS = "AudioCaptureService:Extra:Recordings";
 
-    public final static String ACTION_FILE_CREATED = "AudioCaptureService:FileCreated";
+    public final static String ACTION_FILES_UPDATED = "AudioCaptureService:FilesUpdated";
     public final static String EXTRA_URI_STRING = "AudioCaptureService:Extra:UriString";
 
     private final static int SERVICE_ID = 1;
@@ -75,18 +79,24 @@ public class AudioCaptureService extends Service {
 
     private boolean isRecording;
     private long recordingStartedAt;
-    private int recordedFilesCount;
 
     private WindowManager windowManager;
 
     private View overlayView;
     private TextView textTop;
-    private Button actionRecord;
+    private TouchableButton actionRecord;
     private TextView textBottom;
 
     private View countdownView;
     private TextView textCount;
     private ArrayList<Runnable> countdownCallbacks;
+
+    private TextView textLatest;
+    private LinearLayout layoutLatestActions;
+
+    private LinkedList<Recording> recordings;
+
+    private MediaPlayer mediaPlayer;
 
     @Override
     @TargetApi(Build.VERSION_CODES.O)
@@ -165,14 +175,86 @@ public class AudioCaptureService extends Service {
                 }
             }
         });
+        actionRecord.setOnTouchListener(moveOnTouchListener);
 
-        Button actionClose = overlayView.findViewById(R.id.actionClose);
+        TouchableButton actionClose = overlayView.findViewById(R.id.actionClose);
         actionClose.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 tearDown();
+                Intent intent = new Intent(AudioCaptureService.this, MainActivity.class);
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                startActivity(intent);
             }
         });
+        actionClose.setOnTouchListener(moveOnTouchListener);
+
+        textLatest = overlayView.findViewById(R.id.textLatest);
+
+        layoutLatestActions = overlayView.findViewById(R.id.layoutLatestActions);
+
+        recordings = new LinkedList<>();
+
+        mediaPlayer = new MediaPlayer();
+        mediaPlayer.setAudioAttributes(
+                new AudioAttributes.Builder()
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .build()
+        );
+
+        TouchableButton actionPlayLatest = overlayView.findViewById(R.id.actionPlayLatest);
+        actionPlayLatest.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                try {
+                    mediaPlayer.reset();
+                    mediaPlayer.setDataSource(AudioCaptureService.this, recordings.getLast().getUri());
+                    mediaPlayer.prepare();
+                    mediaPlayer.start();
+                } catch (IOException e) {
+                    throw new Error();
+                }
+            }
+        });
+        actionPlayLatest.setOnTouchListener(moveOnTouchListener);
+
+        TouchableButton actionDiscardLatest = overlayView.findViewById(R.id.actionDiscardLatest);
+        actionDiscardLatest.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                Intent intent = new Intent(ACTION_FILES_UPDATED);
+                LocalBroadcastManager.getInstance(AudioCaptureService.this).sendBroadcast(intent);
+
+                String[] filenames = MainActivity.getStoredFilenames(AudioCaptureService.this);
+                if (filenames.length > 0) {
+                    String[] newFilenames = new String[filenames.length - 1];
+                    System.arraycopy(filenames, 0, newFilenames, 0, filenames.length - 1);
+                    MainActivity.storeFilenames(AudioCaptureService.this, newFilenames);
+                    if (newFilenames.length == 0) {
+                        SharedPreferences uiDb = getSharedPreferences(MainActivity.REF_DB_STATE, Context.MODE_PRIVATE);
+                        SharedPreferences.Editor uiDbEditor = uiDb.edit();
+                        uiDbEditor.putBoolean(MainActivity.REF_DB_AFTER_CAPTURING, false);
+                        uiDbEditor.apply();
+                    }
+                }
+
+                Recording discardedRecording = recordings.removeLast();
+                Uri uri = discardedRecording.getUri();
+                String path = uri.getPath();
+                new File(path).delete();
+
+                textBottom.setText(getString(R.string.recorded_files, recordings.size()));
+                if (recordings.size() == 0) {
+                    layoutLatestActions.setVisibility(View.GONE);
+                    textLatest.setVisibility(View.GONE);
+                } else {
+                    Recording recording = recordings.getLast();
+                    textLatest.setText(getString(R.string.latest_file, recording.getDuration() / 1000d));
+                }
+            }
+        });
+        actionDiscardLatest.setOnTouchListener(moveOnTouchListener);
 
         textTop = overlayView.findViewById(R.id.textTop);
         refreshTime(0);
@@ -224,6 +306,9 @@ public class AudioCaptureService extends Service {
         }
         record.release();
         projection.stop();
+        if (mediaPlayer.isPlaying()) {
+            mediaPlayer.stop();
+        }
         stopSelf();
     }
 
@@ -241,6 +326,25 @@ public class AudioCaptureService extends Service {
         }
         MediaProjectionManager projectionManager = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
         projection = projectionManager.getMediaProjection(Activity.RESULT_OK, (Intent) intent.getParcelableExtra(EXTRA_RESULT_DATA));
+        if (intent.hasExtra(EXTRA_RECORDINGS)) {
+            String[] filenames = intent.getStringArrayExtra(EXTRA_RECORDINGS);
+            for (String filename : filenames) {
+                Uri uri = Uri.parse(filename);
+                MediaMetadataRetriever metadataRetriever = new MediaMetadataRetriever();
+                metadataRetriever.setDataSource(this, uri);
+                String durationStr = metadataRetriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION);
+                long duration = Long.parseLong(durationStr);
+                Recording recording = new Recording(uri, duration);
+                recordings.add(recording);
+            }
+            if (recordings.size() > 0) {
+                Recording recording = recordings.getLast();
+                textBottom.setText(getString(R.string.recorded_files, recordings.size()));
+                textLatest.setVisibility(View.VISIBLE);
+                textLatest.setText(getString(R.string.latest_file, recording.getDuration() / 1000d));
+                layoutLatestActions.setVisibility(View.VISIBLE);
+            }
+        }
         AudioPlaybackCaptureConfiguration config = new AudioPlaybackCaptureConfiguration.Builder(projection)
                 .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                 .build();
@@ -276,7 +380,7 @@ public class AudioCaptureService extends Service {
             capturesDir.mkdirs();
         }
 
-        String timestamp = new SimpleDateFormat("dd-MM-yyyy-hh-mm-ss-SSS", Locale.US).format(new Date());
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd-hh-mm-ss-SSS", Locale.US).format(new Date());
         String filename = String.format("Capture-%s.pcm", timestamp);
         return new File(capturesDir.getAbsolutePath() + "/" + filename);
     }
@@ -338,27 +442,40 @@ public class AudioCaptureService extends Service {
 
             Uri uri = Uri.fromFile(wavFile);
 
-            Intent intent = new Intent(ACTION_FILE_CREATED);
+            Intent intent = new Intent(ACTION_FILES_UPDATED);
             intent.putExtra(EXTRA_URI_STRING, uri.toString());
             LocalBroadcastManager.getInstance(this).sendBroadcast(intent);
 
             SharedPreferences uiDb = getSharedPreferences(MainActivity.REF_DB_STATE, Context.MODE_PRIVATE);
-            boolean afterAdding = uiDb.getBoolean(MainActivity.REF_DB_AFTER_ADDING, false);
             SharedPreferences.Editor uiDbEditor = uiDb.edit();
+            boolean afterSelecting = uiDb.getBoolean(MainActivity.REF_DB_AFTER_SELECTING, false);
+            boolean afterAdding = uiDb.getBoolean(MainActivity.REF_DB_AFTER_ADDING, false);
             ArrayList<String> newFilenames;
-            if (afterAdding) {
+            if (afterSelecting || afterAdding) {
                 newFilenames = new ArrayList<>();
+                uiDbEditor.putBoolean(MainActivity.REF_DB_MISMATCHING_SORTING, false);
+                uiDbEditor.putBoolean(MainActivity.REF_DB_INTERSECTING_NAMES, false);
+                uiDbEditor.putBoolean(MainActivity.REF_DB_SORT_BY_NAME, false);
+                uiDbEditor.putBoolean(MainActivity.REF_DB_INTERSECTING_DATES, false);
+                uiDbEditor.putBoolean(MainActivity.REF_DB_SORT_BY_DATE, false);
+                uiDbEditor.putBoolean(MainActivity.REF_DB_AFTER_SELECTING, false);
                 uiDbEditor.putBoolean(MainActivity.REF_DB_AFTER_ADDING, false);
+                uiDbEditor.apply();
             } else {
                 String[] filenames = MainActivity.getStoredFilenames(this);
                 newFilenames = new ArrayList<>(Arrays.asList(filenames));
             }
             newFilenames.add(uri.toString());
-            uiDbEditor.putStringSet(MainActivity.REF_DB_SELECTED_FILENAMES, new HashSet<>(newFilenames));
-            uiDbEditor.apply();
+            MainActivity.storeFilenames(this, newFilenames.toArray(new String[0]));
+            uiDbEditor.putBoolean(MainActivity.REF_DB_AFTER_CAPTURING, true);
 
-            recordedFilesCount++;
-            textBottom.setText(getString(R.string.recorded_files, recordedFilesCount));
+            long duration = System.currentTimeMillis() - recordingStartedAt;
+            Recording recording = new Recording(uri, duration);
+            recordings.add(recording);
+            textBottom.setText(getString(R.string.recorded_files, recordings.size()));
+            textLatest.setVisibility(View.VISIBLE);
+            textLatest.setText(getString(R.string.latest_file, recording.getDuration() / 1000d));
+            layoutLatestActions.setVisibility(View.VISIBLE);
             handler.post(new Runnable() {
                 @Override
                 public void run() {
@@ -389,5 +506,23 @@ public class AudioCaptureService extends Service {
     @Override
     public IBinder onBind(Intent intent) {
         return null;
+    }
+
+    private static class Recording {
+        private final Uri uri;
+        private final long duration;
+
+        public Recording(Uri uri, long duration) {
+            this.uri = uri;
+            this.duration = duration;
+        }
+
+        public Uri getUri() {
+            return uri;
+        }
+
+        public long getDuration() {
+            return duration;
+        }
     }
 }
