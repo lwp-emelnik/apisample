@@ -37,4 +37,10 @@ public class SoundPlayer {
             mainActivity.showMsg(R.string.audio_playing_error);
         }
     }
+
+    public void stop() {
+        if (mediaPlayer.isPlaying()) {
+            mediaPlayer.stop();
+        }
+    }
 }

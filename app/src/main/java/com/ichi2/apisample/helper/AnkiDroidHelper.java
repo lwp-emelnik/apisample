@@ -18,6 +18,8 @@ import androidx.core.content.ContextCompat;
 import com.ichi2.anki.FlashCardsContract;
 import com.ichi2.anki.api.AddContentApi;
 import com.ichi2.apisample.helper.equality.EqualityChecker;
+import com.ichi2.apisample.helper.equality.FieldEqualityChecker;
+import com.ichi2.apisample.helper.equality.ValueEqualityChecker;
 import com.ichi2.apisample.helper.search.SearchExpressionMaker;
 
 import java.io.File;
@@ -165,7 +167,7 @@ public class AnkiDroidHelper {
         cursor.moveToNext();
         String existingCss = cursor.getString(cursor.getColumnIndex(FlashCardsContract.Model.CSS));
         String existingNumCards = cursor.getString(cursor.getColumnIndex(FlashCardsContract.Model.NUM_CARDS));
-        if (!existingCss.equals(css) || Integer.parseInt(existingNumCards) != cards.length) {
+        if (!StringUtil.strip(existingCss).equals(css) || Integer.parseInt(existingNumCards) != cards.length) {
             return false;
         }
 
@@ -185,7 +187,9 @@ public class AnkiDroidHelper {
             String existingName = cursor.getString(colIdxName);
             String existingQfmt = cursor.getString(colIdxQfmt);
             String existingAfmt = cursor.getString(colIdxAfmt);
-            if (!existingName.equals(cards[i]) || !existingQfmt.equals(qfmt[i]) || !existingAfmt.equals(afmt[i])) {
+            if (!StringUtil.strip(existingName).equals(cards[i]) ||
+                    !StringUtil.strip(existingQfmt).equals(qfmt[i]) ||
+                    !StringUtil.strip(existingAfmt).equals(afmt[i])) {
                 return false;
             }
         }
@@ -207,27 +211,14 @@ public class AnkiDroidHelper {
      * @throws IllegalArgumentException if the model with the provided id does not exist
      */
     public Long updateCustomModel(long modelId, String[] fields, String[] cards, String[] qfmt, String[] afmt, String css) {
-        ContentValues values = new ContentValues();
-        values.put(FlashCardsContract.Model.CSS, css);
-        values.put(FlashCardsContract.Model.NUM_CARDS, cards.length);
         Uri modelUri = Uri.withAppendedPath(FlashCardsContract.Model.CONTENT_URI, String.valueOf(modelId));
-        int updated;
-        try {
-            updated = mResolver.update(modelUri, values, null, null);
-        } catch (Exception e) {
-            throw new IllegalArgumentException();
-        }
-        if (updated == 0) {
-            return null;
-        }
-
         Uri fieldsUri = Uri.withAppendedPath(modelUri, "fields");
         Set<String> existingFields = new HashSet<>(Arrays.asList(getFieldList(modelId)));
         for (String field : fields) {
             if (existingFields.contains(field)) {
                 continue;
             }
-            values = new ContentValues();
+            ContentValues values = new ContentValues();
             values.put(FlashCardsContract.Model.FIELD_NAME, field);
             try {
                 Uri fieldUri = mResolver.insert(fieldsUri, values);
@@ -239,6 +230,19 @@ public class AnkiDroidHelper {
             }
         }
 
+        ContentValues modelValues = new ContentValues();
+        modelValues.put(FlashCardsContract.Model.CSS, css);
+        modelValues.put(FlashCardsContract.Model.NUM_CARDS, cards.length);
+        int updated;
+        try {
+            updated = mResolver.update(modelUri, modelValues, null, null);
+        } catch (Exception e) {
+            throw new IllegalArgumentException();
+        }
+        if (updated == 0) {
+            return null;
+        }
+
         Uri templatesUri = Uri.withAppendedPath(modelUri, "templates");
         Cursor cursor = mResolver.query(templatesUri, null, null, null, null);
         int templatesCount = cursor.getCount();
@@ -248,7 +252,7 @@ public class AnkiDroidHelper {
         int i = 0;
         for (; i < last; i++) {
             Uri templateUri = Uri.withAppendedPath(templatesUri, Integer.toString(i));
-            values = new ContentValues();
+            ContentValues values = new ContentValues();
             values.put(FlashCardsContract.CardTemplate.NAME, cards[i]);
             values.put(FlashCardsContract.CardTemplate.QUESTION_FORMAT, qfmt[i]);
             values.put(FlashCardsContract.CardTemplate.ANSWER_FORMAT, afmt[i]);
@@ -259,7 +263,7 @@ public class AnkiDroidHelper {
         }
         if (templatesToAdd) {
             for (; i < cards.length; i++) {
-                values = new ContentValues();
+                ContentValues values = new ContentValues();
                 values.put(FlashCardsContract.CardTemplate.NAME, cards[i]);
                 values.put(FlashCardsContract.CardTemplate.QUESTION_FORMAT, qfmt[i]);
                 values.put(FlashCardsContract.CardTemplate.ANSWER_FORMAT, afmt[i]);
@@ -403,7 +407,7 @@ public class AnkiDroidHelper {
         }
     };
 
-    public static final EqualityChecker DEFAULT_EQUALITY_CHECKER = new EqualityChecker() {
+    public static final ValueEqualityChecker DEFAULT_EQUALITY_CHECKER = new ValueEqualityChecker() {
         @Override
         public boolean areEqual(String v1, String v2) {
             return v1.equalsIgnoreCase(v2);
@@ -413,18 +417,18 @@ public class AnkiDroidHelper {
     public LinkedList<Map<String, String>> findNotes(long modelId, final Map<String, String> data,
                                                      Map<String, String> fieldDefaultValues,
                                                      Map<String, SearchExpressionMaker> fieldSearchExpressionMakers,
-                                                     Map<String, EqualityChecker> fieldEqualityCheckers)
+                                                     Map<String, EqualityChecker> equalityCheckers)
             throws InvalidAnkiDatabase_fieldAndFieldNameCountMismatchException {
         ArrayList<Map<String, String>> dataSet = new ArrayList<Map<String, String>>() {{
             add(data);
         }};
-        return findNotes(modelId, dataSet, fieldDefaultValues, fieldSearchExpressionMakers, fieldEqualityCheckers);
+        return findNotes(modelId, dataSet, fieldDefaultValues, fieldSearchExpressionMakers, equalityCheckers);
     }
 
     public LinkedList<Map<String, String>> findNotes(long modelId, ArrayList<Map<String, String>> dataSet,
                                                      Map<String, String> fieldDefaultValues,
                                                      Map<String, SearchExpressionMaker> fieldSearchExpressionMakers,
-                                                     Map<String, EqualityChecker> fieldEqualityCheckers)
+                                                     Map<String, EqualityChecker> equalityCheckers)
             throws InvalidAnkiDatabase_fieldAndFieldNameCountMismatchException {
         if (dataSet.size() == 0) {
             return new LinkedList<>();
@@ -442,9 +446,12 @@ public class AnkiDroidHelper {
                 if (data.containsKey(fieldName)) {
                     String value = data.get(fieldName);
                     if (!value.isEmpty() && fieldDefaultValues.containsKey(fieldName)) {
-                        EqualityChecker equalityChecker = fieldEqualityCheckers.getOrDefault(fieldName, DEFAULT_EQUALITY_CHECKER);
+                        EqualityChecker defaultEqualityChecker = new FieldEqualityChecker(fieldName, DEFAULT_EQUALITY_CHECKER);
+                        EqualityChecker equalityChecker = equalityCheckers.getOrDefault(fieldName, defaultEqualityChecker);
                         String defaultValue = fieldDefaultValues.get(fieldName);
-                        if (equalityChecker.areEqual(value, defaultValue)) {
+                        Map<String, String> defaultData = new HashMap<>(data);
+                        defaultData.put(fieldName, defaultValue);
+                        if (equalityChecker.areEqual(data, defaultData)) {
                             defaultFields.add(fieldName);
                         }
                     }
@@ -523,18 +530,28 @@ public class AnkiDroidHelper {
 
                     for (int i = 0; i < fieldNames.length; ++i) {
                         String fieldName = fieldNames[i];
-                        String field = fields[i];
+                        String resultValue = fields[i];
                         // additional filtering for non-definitive expressions
                         // can be computationally expensive
                         SearchExpressionMaker expressionMaker = fieldSearchExpressionMakers.getOrDefault(fieldName, DEFAULT_SEARCH_EXPRESSION_MAKER);
                         if (!expressionMaker.isDefinitive()) {
-                            EqualityChecker equalityChecker = fieldEqualityCheckers.getOrDefault(fieldName, DEFAULT_EQUALITY_CHECKER);
+                            EqualityChecker defaultEqualityChecker = new FieldEqualityChecker(fieldName, DEFAULT_EQUALITY_CHECKER);
+                            EqualityChecker equalityChecker = equalityCheckers.getOrDefault(fieldName, defaultEqualityChecker);
                             boolean matching = false;
                             for (Map<String, String> data : dataSet) {
                                 String value = data.getOrDefault(fieldName, "");
-                                boolean defaultEquality = field.isEmpty() && fieldDefaultValues.containsKey(fieldName)
-                                        && equalityChecker.areEqual(value, fieldDefaultValues.get(fieldName));
-                                if (value.isEmpty() || equalityChecker.areEqual(value, field) || defaultEquality) {
+                                boolean defaultEquality = false;
+                                if (resultValue.isEmpty() && fieldDefaultValues.containsKey(fieldName)) {
+                                    String defaultValue = fieldDefaultValues.get(fieldName);
+                                    Map<String, String> defaultData = new HashMap<>(data);
+                                    defaultData.put(fieldName, defaultValue);
+                                    if (equalityChecker.areEqual(data, defaultData)) {
+                                        defaultEquality = true;
+                                    }
+                                }
+                                Map<String, String> resultData = new HashMap<>(data);
+                                resultData.put(fieldName, resultValue);
+                                if (value.isEmpty() || equalityChecker.areEqual(data, resultData) || defaultEquality) {
                                     matching = true;
                                     break;
                                 }
@@ -543,7 +560,7 @@ public class AnkiDroidHelper {
                                 continue rows;
                             }
                         }
-                        item.put(fieldName, field);
+                        item.put(fieldName, resultValue);
                     }
 
                     result.add(item);
